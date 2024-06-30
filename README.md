@@ -21,7 +21,7 @@ SNP Melt is a high-performance, multi-threaded C program designed to identify an
 1. Ensure you have the required libraries installed on your system.
 2. Clone this repository:
 
-    git clone https://github.com/yourusername/snp-melt.git
+    git clone https://github.com/msadikyildiz/snp_melt.git
     cd snp-melt"""
 
 3. Compile the program:
@@ -58,7 +58,6 @@ Additionally, the program prints processing statistics to stderr, including:
 
 ## Performance Considerations
 
-- The program uses multi-threading to significantly speed up processing.
 - Memory usage is optimized by processing the BAM file in chunks.
 - The `-m` option allows for fine-tuning memory allocation based on expected SNP frequency.
 
@@ -67,15 +66,3 @@ Additionally, the program prints processing statistics to stderr, including:
 - The program discards reads with indels or structural variants.
 - Reads with soft clips are excluded from analysis.
 - The program assumes a sorted and indexed BAM file.
-
-## Contributing
-
-Contributions to improve SNP Melt are welcome. Please feel free to submit pull requests or open issues to discuss potential enhancements.
-
-## License
-
-[Include your chosen license here]
-
-## Citation
-
-If you use SNP Melt in your research, please cite here.
