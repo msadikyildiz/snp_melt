@@ -12,6 +12,8 @@
 #include <locale.h>
 
 #define DEFAULT_MAX_SNP_PER_READ 50
+#define DEFAULT_BASE_QUALITY_CUTOFF 30
+#define DEFAULT_NUM_THREADS 8
 
 // Structure for storing mutation information
 typedef struct {
@@ -19,7 +21,7 @@ typedef struct {
     int reference_position;
     char mutated_base;
     char reference_base;
-    int base_quality;
+    uint8_t base_quality;
 } Mutation;
 
 // Structure for passing data to each thread
@@ -33,7 +35,10 @@ typedef struct {
     int mutation_count;
     long reads_processed;
     long reads_eliminated;
+    long reads_has_indel_or_soft_clip;
+    long reads_below_avg_quality;
     int max_mutations_per_thread;
+    int base_quality_cutoff;
 } ThreadData;
 
 // Function to get the total number of alignments in the BAM file
@@ -145,6 +150,7 @@ void *process_bam(void *arg) {
         if (has_indel_or_soft_clip || (alignment->core.flag & BAM_FUNMAP)) {
             // Skip alignments with indels, soft clips, or unmapped reads
             data->reads_eliminated++;
+            data->reads_has_indel_or_soft_clip++;
             continue;
         }
 
@@ -163,6 +169,19 @@ void *process_bam(void *arg) {
         // Check for SNPs
         uint8_t *seq = bam_get_seq(alignment);
         uint8_t *qual = bam_get_qual(alignment);
+        
+        // If average quality of the read is below the cutoff, skip the read
+        double avg_qual = 0;
+        for (int j = 0; j < alignment->core.l_qseq; j++) {
+            avg_qual += qual[j];
+        }
+        avg_qual /= alignment->core.l_qseq;
+        if (avg_qual < data->base_quality_cutoff) {
+            data->reads_eliminated++;
+            data->reads_below_avg_quality++;
+            continue;
+        }
+
         int read_pos = 0;
 
         for (int j = 0; j < num_cigar; ++j) {
@@ -177,7 +196,7 @@ void *process_bam(void *arg) {
                     char ref_base = ref_seq[ref_start + read_pos - ref_start];
 
                     // Check for mismatch
-                    if (decoded_base != ref_base && base_quality >= 20) { // Assuming quality >= 20
+                    if (decoded_base != ref_base && base_quality >= data->base_quality_cutoff) {
                         // Report SNP mutation
                         Mutation mutation;
                         snprintf(mutation.read_id, sizeof(mutation.read_id), "%s", bam_get_qname(alignment));
@@ -214,11 +233,12 @@ void *process_bam(void *arg) {
 
 // Function to print the help message
 void print_help() {
-    printf("Usage: snp_melt -b <bam_file> -r <reference_file> -t <num_threads> [-m <max_snp_per_read>]\n");
+    printf("Usage: snp_melt -b <bam_file> -r <reference_file> [-q <base_quality_cutoff>] [-t <num_threads>] [-m <max_snp_per_read>]\n");
     printf("Options:\n");
     printf("  -b <bam_file>         Input BAM file\n");
     printf("  -r <reference_file>   Reference FASTA file\n");
-    printf("  -t <num_threads>      Number of threads to use\n");
+    printf("  -q <base_quality_cutoff>   Base quality cutoff (default: 30)\n");
+    printf("  -t <num_threads>      Number of threads to use (default: 8)\n");
     printf("  -m <max_snp_per_read>  Estimated SNP count per alignment (default: 100)\n");
     printf("  --help                Display this help message\n");
 }
@@ -226,21 +246,25 @@ void print_help() {
 int main(int argc, char *argv[]) {
     const char *bam_filename = NULL;
     const char *ref_filename = NULL;
-    int num_threads = 0;
+    int num_threads = DEFAULT_NUM_THREADS;
     int estimated_snp_count_per_alignment = DEFAULT_MAX_SNP_PER_READ;
+    int base_quality_cutoff = DEFAULT_BASE_QUALITY_CUTOFF;
 
     // Set the locale to the user's default locale
     setlocale(LC_NUMERIC, "");
 
     // Parse command-line arguments
     int opt;
-    while ((opt = getopt(argc, argv, "b:r:t:m:")) != -1) {
+    while ((opt = getopt(argc, argv, "b:r:q:t:m:")) != -1) {
         switch (opt) {
             case 'b':
                 bam_filename = optarg;
                 break;
             case 'r':
                 ref_filename = optarg;
+                break;
+            case 'q':
+                base_quality_cutoff = atoi(optarg);
                 break;
             case 't':
                 num_threads = atoi(optarg);
@@ -292,7 +316,10 @@ int main(int argc, char *argv[]) {
         thread_data[i].mutation_count = 0;
         thread_data[i].reads_processed = 0;
         thread_data[i].reads_eliminated = 0;
+        thread_data[i].reads_has_indel_or_soft_clip = 0;
+        thread_data[i].reads_below_avg_quality = 0;
         thread_data[i].max_mutations_per_thread = max_mutations_per_thread;
+        thread_data[i].base_quality_cutoff = base_quality_cutoff;
     }
 
     // Set up thread data
@@ -321,11 +348,15 @@ int main(int argc, char *argv[]) {
 
     long total_reads_processed = 0;
     long total_reads_eliminated = 0;
+    long total_reads_has_indel_or_soft_clip = 0;
+    long total_reads_below_avg_quality = 0;
     long total_mutations = 0;
 
     for (int i = 0; i < num_threads; ++i) {
         total_reads_processed += thread_data[i].reads_processed;
         total_reads_eliminated += thread_data[i].reads_eliminated;
+        total_reads_has_indel_or_soft_clip += thread_data[i].reads_has_indel_or_soft_clip;
+        total_reads_below_avg_quality += thread_data[i].reads_below_avg_quality;
         total_mutations += thread_data[i].mutation_count;
 
         for (int j = 0; j < thread_data[i].mutation_count; ++j) {
@@ -339,6 +370,10 @@ int main(int argc, char *argv[]) {
     double percent_eliminated = ((double)total_reads_eliminated / total_reads_processed) * 100;
     fprintf(stderr, "Reads processed:\t%'ld\n", total_reads_processed);
     fprintf(stderr, "Reads eliminated:\t%'ld\t(%.2f%%)\n", total_reads_eliminated, percent_eliminated);
+    fprintf(stderr, "Reads with indels or soft clips:\t%'ld\t(%.2f%%)\n", total_reads_has_indel_or_soft_clip,
+         ((double)total_reads_has_indel_or_soft_clip / total_reads_eliminated) * 100);
+    fprintf(stderr, "Reads below average quality:\t%'ld\t(%.2f%%)\n", total_reads_below_avg_quality,
+         ((double)total_reads_below_avg_quality / total_reads_eliminated) * 100);
     double snp_count_per_read = (double)total_mutations / (total_reads_processed-total_reads_eliminated);
     fprintf(stderr, "snps found:\t%'ld\t(%.1f snps per read)\n", total_mutations, snp_count_per_read);
 
