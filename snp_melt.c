@@ -88,148 +88,148 @@ void to_uppercase(char *seq) {
 }
 
 // Function to process BAM file in a thread
-void *process_bam(void *arg) {
-    ThreadData *data = (ThreadData *)arg;
+    void *process_bam(void *arg) {
+        ThreadData *data = (ThreadData *)arg;
 
-    samFile *bam_file = sam_open(data->bam_filename, "r"); // Open BAM file for reading
-    if (bam_file == NULL) {
-        fprintf(stderr, "Thread %d: Failed to open BAM file: %s\n", data->thread_id, data->bam_filename);
-        pthread_exit(NULL);
-    }
-
-    bam_hdr_t *header = sam_hdr_read(bam_file); // Read header
-    bam1_t *alignment = bam_init1(); // Initialize an alignment structure
-
-    hts_idx_t *idx = sam_index_load(bam_file, data->bam_filename);
-    if (!idx) {
-        fprintf(stderr, "Thread %d: Failed to load BAM index for file: %s\n", data->thread_id, data->bam_filename);
-        pthread_exit(NULL);
-    }
-
-    // Create iterator to cover all alignments
-    hts_itr_t *iter = sam_itr_queryi(idx, HTS_IDX_START, 0, HTS_IDX_NOCOOR);
-    if (!iter) {
-        fprintf(stderr, "Thread %d: Failed to create iterator for BAM file: %s\n", data->thread_id, data->bam_filename);
-        pthread_exit(NULL);
-    }
-
-    // Load the reference sequence
-    faidx_t *fai = fai_load(data->ref_filename);
-    if (fai == NULL) {
-        fprintf(stderr, "Thread %d: Failed to load reference sequence: %s\n", data->thread_id, data->ref_filename);
-        pthread_exit(NULL);
-    }
-
-    // Skip to the start alignment for this thread
-    for (int i = 0; i < data->start_alignment; i++) {
-        if (sam_itr_next(bam_file, iter, alignment) < 0) {
+        samFile *bam_file = sam_open(data->bam_filename, "r"); // Open BAM file for reading
+        if (bam_file == NULL) {
+            fprintf(stderr, "Thread %d: Failed to open BAM file: %s\n", data->thread_id, data->bam_filename);
             pthread_exit(NULL);
         }
-    }
 
-    // Process the alignments assigned to this thread
-    for (int i = data->start_alignment; i < data->end_alignment; i++) {
-        if (sam_itr_next(bam_file, iter, alignment) < 0) {
-            break;
+        bam_hdr_t *header = sam_hdr_read(bam_file); // Read header
+        bam1_t *alignment = bam_init1(); // Initialize an alignment structure
+
+        hts_idx_t *idx = sam_index_load(bam_file, data->bam_filename);
+        if (!idx) {
+            fprintf(stderr, "Thread %d: Failed to load BAM index for file: %s\n", data->thread_id, data->bam_filename);
+            pthread_exit(NULL);
         }
 
-        data->reads_processed++;
-        uint32_t *cigar = bam_get_cigar(alignment);
-        int num_cigar = alignment->core.n_cigar;
+        // Create iterator to cover all alignments
+        hts_itr_t *iter = sam_itr_queryi(idx, HTS_IDX_START, 0, HTS_IDX_NOCOOR);
+        if (!iter) {
+            fprintf(stderr, "Thread %d: Failed to create iterator for BAM file: %s\n", data->thread_id, data->bam_filename);
+            pthread_exit(NULL);
+        }
 
-        // Check for indels or soft-clipped ends
-        int has_indel_or_soft_clip = 0;
-        for (int j = 0; j < num_cigar; ++j) {
-            int cigar_op = bam_cigar_op(cigar[j]);
-            if (cigar_op == BAM_CINS || cigar_op == BAM_CDEL || cigar_op == BAM_CSOFT_CLIP) {
-                has_indel_or_soft_clip = 1;
+        // Load the reference sequence
+        faidx_t *fai = fai_load(data->ref_filename);
+        if (fai == NULL) {
+            fprintf(stderr, "Thread %d: Failed to load reference sequence: %s\n", data->thread_id, data->ref_filename);
+            pthread_exit(NULL);
+        }
+
+        // Skip to the start alignment for this thread
+        for (int i = 0; i < data->start_alignment; i++) {
+            if (sam_itr_next(bam_file, iter, alignment) < 0) {
+                pthread_exit(NULL);
+            }
+        }
+
+        // Process the alignments assigned to this thread
+        for (int i = data->start_alignment; i < data->end_alignment; i++) {
+            if (sam_itr_next(bam_file, iter, alignment) < 0) {
                 break;
             }
-        }
 
-        if (has_indel_or_soft_clip || (alignment->core.flag & BAM_FUNMAP)) {
-            // Skip alignments with indels, soft clips, or unmapped reads
-            data->reads_eliminated++;
-            data->reads_has_indel_or_soft_clip++;
-            continue;
-        }
+            data->reads_processed++;
+            uint32_t *cigar = bam_get_cigar(alignment);
+            int num_cigar = alignment->core.n_cigar;
 
-        // Get reference sequence name and position
-        const char *ref_name = header->target_name[alignment->core.tid];
-        int ref_start = alignment->core.pos;
-        int ref_end = ref_start + alignment->core.l_qseq;
-
-        // Fetch reference sequence
-        int seq_len;
-        char *ref_seq = faidx_fetch_seq(fai, ref_name, ref_start, ref_end - 1, &seq_len);
-
-        // Convert reference sequence to uppercase
-        to_uppercase(ref_seq);
-
-        // Check for SNPs
-        uint8_t *seq = bam_get_seq(alignment);
-        uint8_t *qual = bam_get_qual(alignment);
-        
-        // If average quality of the read is below the cutoff, skip the read
-        double avg_qual = 0;
-        for (int j = 0; j < alignment->core.l_qseq; j++) {
-            avg_qual += qual[j];
-        }
-        avg_qual /= alignment->core.l_qseq;
-        if (avg_qual < data->base_quality_cutoff) {
-            data->reads_eliminated++;
-            data->reads_below_avg_quality++;
-            continue;
-        }
-
-        int read_pos = 0;
-
-        for (int j = 0; j < num_cigar; ++j) {
-            int cigar_op = bam_cigar_op(cigar[j]);
-            int cigar_len = bam_cigar_oplen(cigar[j]);
-
-            if (cigar_op == BAM_CMATCH || cigar_op == BAM_CEQUAL || cigar_op == BAM_CDIFF) {
-                for (int k = 0; k < cigar_len; ++k) {
-                    int base = bam_seqi(seq, read_pos);
-                    int base_quality = qual[read_pos];
-                    char decoded_base = decode_base(base);
-                    char ref_base = ref_seq[ref_start + read_pos - ref_start];
-
-                    // Check for mismatch
-                    if (decoded_base != ref_base && base_quality >= data->base_quality_cutoff) {
-                        // Report SNP mutation
-                        Mutation mutation;
-                        snprintf(mutation.read_id, sizeof(mutation.read_id), "%s", bam_get_qname(alignment));
-                        mutation.reference_position = alignment->core.pos + read_pos + 1;
-                        mutation.mutated_base = decoded_base;
-                        mutation.reference_base = ref_base;
-                        mutation.base_quality = base_quality;
-
-                        // Add mutation to the local list
-                        if (data->mutation_count < data->max_mutations_per_thread) {
-                            data->mutations[data->mutation_count++] = mutation;
-                        }
-                    }
-
-                    read_pos++;
+            // Check for indels or soft-clipped ends
+            int has_indel_or_soft_clip = 0;
+            for (int j = 0; j < num_cigar; ++j) {
+                int cigar_op = bam_cigar_op(cigar[j]);
+                if (cigar_op == BAM_CINS || cigar_op == BAM_CDEL || cigar_op == BAM_CSOFT_CLIP) {
+                    has_indel_or_soft_clip = 1;
+                    break;
                 }
-            } else if (cigar_op == BAM_CINS || cigar_op == BAM_CDEL || cigar_op == BAM_CSOFT_CLIP) {
-                read_pos += cigar_len;
             }
+
+            if (has_indel_or_soft_clip || (alignment->core.flag & BAM_FUNMAP)) {
+                // Skip alignments with indels, soft clips, or unmapped reads
+                data->reads_eliminated++;
+                data->reads_has_indel_or_soft_clip++;
+                continue;
+            }
+
+            // Get reference sequence name and position
+            const char *ref_name = header->target_name[alignment->core.tid];
+            int ref_start = alignment->core.pos;
+            int ref_end = ref_start + alignment->core.l_qseq;
+
+            // Fetch reference sequence
+            int seq_len;
+            char *ref_seq = faidx_fetch_seq(fai, ref_name, ref_start, ref_end - 1, &seq_len);
+
+            // Convert reference sequence to uppercase
+            to_uppercase(ref_seq);
+
+            // Check for SNPs
+            uint8_t *seq = bam_get_seq(alignment);
+            uint8_t *qual = bam_get_qual(alignment);
+            
+            // If average quality of the read is below the cutoff, skip the read
+            double avg_qual = 0;
+            for (int j = 0; j < alignment->core.l_qseq; j++) {
+                avg_qual += qual[j];
+            }
+            avg_qual /= alignment->core.l_qseq;
+            if (avg_qual < data->base_quality_cutoff) {
+                data->reads_eliminated++;
+                data->reads_below_avg_quality++;
+                continue;
+            }
+
+            int read_pos = 0;
+
+            for (int j = 0; j < num_cigar; ++j) {
+                int cigar_op = bam_cigar_op(cigar[j]);
+                int cigar_len = bam_cigar_oplen(cigar[j]);
+
+                if (cigar_op == BAM_CMATCH || cigar_op == BAM_CEQUAL || cigar_op == BAM_CDIFF) {
+                    for (int k = 0; k < cigar_len; ++k) {
+                        int base = bam_seqi(seq, read_pos);
+                        int base_quality = qual[read_pos];
+                        char decoded_base = decode_base(base);
+                        char ref_base = ref_seq[read_pos];
+
+                        // Check for mismatch
+                        if (decoded_base != ref_base && base_quality >= data->base_quality_cutoff) {
+                            // Report SNP mutation
+                            Mutation mutation;
+                            snprintf(mutation.read_id, sizeof(mutation.read_id), "%s", bam_get_qname(alignment));
+                            mutation.reference_position = ref_start + read_pos;
+                            mutation.mutated_base = decoded_base;
+                            mutation.reference_base = ref_base;
+                            mutation.base_quality = base_quality;
+
+                            // Add mutation to the local list
+                            if (data->mutation_count < data->max_mutations_per_thread) {
+                                data->mutations[data->mutation_count++] = mutation;
+                            }
+                        }
+
+                        read_pos++;
+                    }
+                } else if (cigar_op == BAM_CINS || cigar_op == BAM_CDEL || cigar_op == BAM_CSOFT_CLIP) {
+                    read_pos += cigar_len;
+                }
+            }
+
+            free(ref_seq);
         }
 
-        free(ref_seq);
+        fai_destroy(fai);
+        hts_itr_destroy(iter);
+        hts_idx_destroy(idx);
+        bam_destroy1(alignment); // Clean up alignment structure
+        bam_hdr_destroy(header); // Clean up header
+        sam_close(bam_file); // Close BAM file
+
+        pthread_exit(NULL);
     }
-
-    fai_destroy(fai);
-    hts_itr_destroy(iter);
-    hts_idx_destroy(idx);
-    bam_destroy1(alignment); // Clean up alignment structure
-    bam_hdr_destroy(header); // Clean up header
-    sam_close(bam_file); // Close BAM file
-
-    pthread_exit(NULL);
-}
 
 // Function to print the help message
 void print_help() {
